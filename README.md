@@ -1,60 +1,128 @@
-# CRC32 10Gbps Pipeline (AXI4-Stream)
+# CRC32 10 Gb/s Pipeline (AXI4-Stream, 4+4 Byte Pipelined, No LUT)
 
-A hardware module that computes **Ethernet CRC-32** over an **AXI4-Stream** at **10 Gb/s** using a **64-bit parallel core** plus a **3-stage alignment pipeline**.  
-Consumes up to 8 bytes per beat @ 156.25 MHz and outputs the final CRC on the **last beat** via `m_axis_tuser[31:0]`. Data itself is transparently forwarded.
+A timing-friendly, **table-free** CRC-32 engine that sustains **64-bit @ 156.25 MHz** (≈ **10 Gb/s** line rate) on AXI4-Stream.  
+Each 64-bit beat is processed in **two 4-byte stages (4+4)** to cut the critical path, so timing closure is much easier than a naïve single-cycle 8-byte CRC.
 
-- CRC mode: RefIn=1, RefOut=1, **poly=0x04C11DB7** (reflected form **0xEDB88320**), **Init=crc_init** (default `0xFFFF_FFFF`), **XorOut=0xFFFF_FFFF**.
-- Implementation: **LSB-first**, right-shift LFSR; per-beat update honors **`TKEEP`**.
+> **CRC flavor**: IEEE 802.3 / Ethernet reflected CRC-32  
+> Polynomial (LSB-first): `0xEDB88320` (reflection of `0x04C11DB7`)  
+> Seed: `0xFFFF_FFFF` · Final XOR: invert (`~crc`) · Per-byte bit order: **LSB-first**
+
 
 ---
 
 ## Features
 
-- AXI4-Stream **slave** input and **master** output
-- **64-bit** datapath @ 156.25 MHz (10 GbE line rate)
-- Correct **cross-beat CRC chaining** for multi-beat packets
-- `TKEEP`-aware (partial final beat & non-contiguous masks supported)
-- **3-stage** alignment pipeline (clean timing to the master side)
-- Proper backpressure handling (`TREADY` propagation)
-- CRC enable bypass (`crc_enable=0` → transparent pass-through, `tuser=0`)
+- **Throughput**: one 64-bit beat **every clock** at 156.25 MHz (≈ 10 Gb/s).
+- **Low timing pressure**: 8 bytes handled as **4+4** (two CRC stages).
+- **Latency**: CRC pipeline **2 cycles**; CRC result is presented on the same cycle as the output `tlast`.
+- **AXI4-Stream pass-through** with full `tvalid/tready` backpressure handling.
+- **`tkeep`**: any pattern (contiguous or sparse) is supported.
+- **No ROM/LUT tables**: portable Verilog-2001; simple to synthesize on any FPGA/ASIC.
+- **Config**: `crc_init` (seed), `crc_enable` (bypass CRC computation without stalling data).
+
 
 ---
 
-## Ports
+## Why Ethernet CRC?
 
-### Clock & Reset
-- `clk` — clock (posedge)
-- `rst_n` — async reset, **active-low**
+- **Interoperability**: matches the most widely used 32-bit CRC in networking and storage (Ethernet, ZIP/PNG, many libraries).
+- **Verification**: plenty of reference implementations and test vectors exist.
+- **Hardware-friendly**: reflected (LSB-first) pipeline maps cleanly to iterative byte processing.
 
-### AXI4-Stream Slave (input)
-- `s_axis_tdata[63:0]` — data (byte0=`[7:0]` … byte7=`[63:56]`)
-- `s_axis_tkeep[7:0]` — byte-valid mask; `TKEEP[i]` ↔ `TDATA[8*i+7:8*i]`
-- `s_axis_tvalid` — input valid
-- `s_axis_tlast` — last beat of packet
-- `s_axis_tready` — module ready
 
-### AXI4-Stream Master (output)
-- `m_axis_tdata[63:0]` — forwarded data (delayed)
-- `m_axis_tkeep[7:0]` — forwarded keep
-- `m_axis_tvalid` — output valid
-- `m_axis_tlast` — forwarded last
-- `m_axis_tuser[31:0]` — **final CRC32** on the **last beat** (`~CRC`, Ethernet)
-- `m_axis_tready` — downstream ready
+---
+
+
+- **Stage A** processes bytes 0..3; **Stage B** processes bytes 4..7.  
+- A two-stage **data/keep/valid/last** pipeline aligns the AXI stream with the 2-cycle CRC pipeline.  
+- The CRC “running state” is carried across beats to ensure **correct cross-beat linking**.  
+- On the output beat whose `tlast=1`, `m_axis_tuser` carries the **inverted** final CRC (Ethernet convention).  
+  On non-last beats, `m_axis_tuser` is `32'h0`.
+
+
+---
+
+## AXI4-Stream Interface
+
+### Slave (input)
+- `s_axis_tdata [63:0]` — input data (byte 0 = `tdata[7:0]`).
+- `s_axis_tkeep [7:0]` — per-byte valid mask (`keep[0]` ↔ `tdata[7:0]`).
+- `s_axis_tvalid` — input beat is valid.
+- `s_axis_tready` — core can accept a beat (follows output backpressure).
+- `s_axis_tlast` — last beat of a packet.
+
+### Master (output)
+- `m_axis_tdata [63:0]` — pass-through data, aligned to CRC pipeline.
+- `m_axis_tkeep [7:0]` — pass-through keep.
+- `m_axis_tvalid` — output beat is valid.
+- `m_axis_tready` — downstream ready.
+- `m_axis_tlast` — last beat of the packet.
+- `m_axis_tuser [31:0]` — **CRC32** of the packet (only valid on the last beat; otherwise 0).
 
 ### Configuration
-- `crc_init[31:0]` — CRC init per packet (default `32'hFFFF_FFFF`)
-- `crc_enable` — 1: compute/output CRC; 0: bypass (no CRC updates)
+- `crc_init [31:0]` — initial seed (recommend `32'hFFFF_FFFF`).
+- `crc_enable` — when `0`, CRC is bypassed (stream still passes through).
+
 
 ---
 
-## How It Works
+## Timing & Throughput
 
-### Handshake & Flow
-- A beat **fires** when `TVALID && TREADY` is high.
-- `s_axis_tready = (!m_axis_tvalid) || m_axis_tready` to propagate backpressure.
+- **Clock**: 156.25 MHz (6.4 ns period) typical for 10G-class streams.  
+- **Throughput**: 64 b per cycle ⇒ ≈10.0 Gb/s sustained when `tvalid&tready` are continuously asserted.  
+- **Critical path**: 4 × `crc8_lsb` per stage (vs 8 × `crc8_lsb` in a single-stage design).  
+- **Latency**: 2 cycles CRC pipeline + pass-through alignment (the provided RTL aligns these so the CRC appears with the correct `tlast`).
 
-### Per-Beat CRC
-- Running state: `crc_state`.
-- Combinational next:  
-  ```systemverilog
-  next_crc = crc64_update(crc_state, s_axis_tdata, s_axis_tkeep);
+> If your device still struggles at 156.25 MHz, the same structure scales:  
+> – Drop to **78.125 MHz** for ≈5 Gb/s with zero RTL changes, or  
+> – Further pipeline the byte sequence (e.g., **2+2+2+2**).
+
+
+---
+
+## `tkeep` & byte order
+
+- `tkeep[i]` corresponds to `tdata[(8*i+7) : (8*i)]` (i.e., `keep[0]` ↔ LSB byte).
+- Non-contiguous `tkeep` patterns are supported; inactive bytes are skipped in the CRC loop.
+- The internal byte update is **LSB-first** per byte (required by the reflected polynomial).
+
+**Examples**
+
+| `tkeep`        | Valid bytes                              |
+|----------------|-------------------------------------------|
+| `8'b1111_1111` | all 8 bytes                               |
+| `8'b0000_1111` | bytes 0..3 only                           |
+| `8'b0101_0101` | bytes 0,2,4,6 (sparse)                    |
+| `8'b0000_0001` | byte 0 only                               |
+
+
+---
+
+## How the CRC is produced
+
+- The CRC state is initialized to `crc_init` at the **first beat of a packet**.  
+- For each beat:
+  - **Stage A** updates CRC with bytes 0..3 (respecting `tkeep[3:0]`).
+  - **Stage B** continues with bytes 4..7 (respecting `tkeep[7:4]`).
+  - The result becomes the **running CRC** for the next beat.
+- On the beat where `tlast=1`, the core outputs `~CRC` on `m_axis_tuser` (Ethernet convention).  
+  The running CRC is reset to `crc_init` for the next packet.
+
+
+---
+
+## Integration Notes
+
+- **Reset**: `rst_n` is async active-low; deassert synchronously in your system where possible.
+- **Backpressure**: `s_axis_tready` follows output availability; the core preserves order and doesn’t drop beats.
+- **Bypass mode**: When `crc_enable=0`, the stream passes through; `m_axis_tuser` remains `0`.
+- **Endianness**: The mapping is byte-wise as described; the algorithm itself is bit-reflected (LSB-first per byte).
+
+
+---
+
+## File List
+
+- `crc32_10gbps_pipeline.v` — DUT (Verilog-2001 RTL, two-stage 4+4 pipeline).
+- `crc32_10gbps_tb.sv` — SystemVerilog testbench (self-checking, uses `string/$urandom_range`).
+
