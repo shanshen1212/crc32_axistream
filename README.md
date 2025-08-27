@@ -124,5 +124,5 @@ Each 64-bit beat is processed in **two 4-byte stages (4+4)** to cut the critical
 ## File List
 
 - `crc32_10gbps_pipeline.v` — DUT (Verilog-2001 RTL, two-stage 4+4 pipeline).
-- `crc32_10gbps_tb.sv` — SystemVerilog testbench (self-checking, uses `string/$urandom_range`).
+- `crc32_10gbps_tb.v` — Verilog testbench (self-checking.
 
